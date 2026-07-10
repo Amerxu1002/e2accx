@@ -1,0 +1,169 @@
+# TODO(#127): split into compose.yaml (production shape) +
+# compose.dev.yaml (local-dev override containing mailpit + demo
+# secrets + loopback port bindings). Today this single file mixes
+# production-shape services with local-dev-only services and env vars,
+# so a production deploy that forgets to drop the `mailpit` service
+# silently funnels outbound mail to the dev catch-all. See #127 for
+# the full plan + the alternative compose-profiles approach.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: e2a
+      POSTGRES_PASSWORD: e2a
+      POSTGRES_DB: e2a
+    # Port 5433 is exposed to the host for local-dev convenience (psql, migrations).
+    # In production, drop this `ports:` block — the e2a service connects via the
+    # internal docker network on :5432 and doesn't need host exposure.
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U e2a -d e2a"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  # Mailpit — a local SMTP catch-all that captures every outbound message
+  # and exposes them in a web UI. Wired into the e2a service below so the
+  # default `docker compose up` experience can exercise outbound flows
+  # (HITL approval notifications, test sends) without real SMTP creds.
+  #
+  # Drop this service in production — the e2a service should point at a
+  # real upstream relay (SES, Postmark, etc.) via E2A_OUTBOUND_SMTP_HOST.
+  mailpit:
+    # Pinned: `:latest` floats and would silently shift the local-dev
+    # baseline across developers and across time. Bump explicitly when
+    # adopting new Mailpit features.
+    image: axllent/mailpit:v1.30.0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1025:1025"   # SMTP, also reachable from the host Go binary in `make run`
+      - "127.0.0.1:8025:8025"   # Web UI — http://localhost:8025
+    environment:
+      # Persist captured mail across restarts so a dev can come back to
+      # an approval link they sent themselves yesterday.
+      MP_DATABASE: /data/mailpit.db
+      MP_MAX_MESSAGES: "5000"
+    volumes:
+      - mailpit:/data
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:8025/api/v1/info"]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+
+  e2a:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mailpit:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - "2525:2525"
+      - "8080:8080"
+    # Load secrets and OAuth credentials from .env if present.
+    # `.env` is gitignored; see .env.example for the full set of vars.
+    # Anything explicitly set under `environment:` below overrides the
+    # .env value, so the database/HMAC defaults stay deterministic for
+    # the demo even if the user edits .env.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      E2A_DATABASE_URL: "postgres://e2a:e2a@postgres:5432/e2a?sslmode=disable"
+      # Demo-only HMAC secret. ≥32 bytes is required by the OAuth
+      # provider (fosite) for HKDF-derived token signing — shorter
+      # values refuse to wire. Override via .env for any non-demo run.
+      E2A_HMAC_SECRET: "demo-hmac-secret-do-not-use-in-production-32"
+      # Demo shared domain so the README's slug-based `agents register`
+      # example works without DNS setup. agents.localhost never resolves
+      # externally, so no real mail will arrive — fine for an API smoke
+      # test. Production deployments override this to a real mail
+      # domain (or unset it to disable slug registration entirely).
+      E2A_SHARED_DOMAIN: "agents.localhost"
+      # Point outbound mail at the Mailpit catch-all so HITL approval
+      # notifications and test sends land in http://localhost:8025
+      # instead of failing with "outbound SMTP relay not configured".
+      # Production overrides every one of these to a real upstream.
+      E2A_OUTBOUND_SMTP_HOST: "mailpit"
+      E2A_OUTBOUND_SMTP_PORT: "1025"
+      E2A_OUTBOUND_SMTP_FROM_DOMAIN: "e2a.localhost"
+      # Enable per-message usage tracking so the dashboard stats strip
+      # (GET /api/dashboard/stats) shows real numbers in the dev
+      # experience. The default is the NoopUsageTracker,
+      # which leaves usage_summaries empty and renders the cards as 0/—.
+      # Production sets this on the e2a-ops compose; mirroring it here
+      # keeps "first docker compose up" feel parity with prod.
+      E2A_USAGE_TRACKING: "true"
+    # Healthcheck is defined in the Dockerfile (HEALTHCHECK instruction)
+    # so it travels with the image. Anyone using the image — including
+    # this compose file — gets it for free.
+
+  web:
+    build:
+      context: web
+      dockerfile: Dockerfile
+      # Mirror the e2a service's E2A_SHARED_DOMAIN below so the
+      # /get-started onboarding flow shows `your-slug@agents.localhost`
+      # in the same context as the running backend. Next.js inlines
+      # NEXT_PUBLIC_* at build time — these can't be moved to
+      # `environment:` because they wouldn't reach the static export.
+      # Production deployments override this at image build with a
+      # real domain (see web/Dockerfile and docs/deployment.md).
+      args:
+        NEXT_PUBLIC_AGENTS_DOMAIN: agents.localhost
+    depends_on:
+      e2a:
+        condition: service_started
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    environment:
+      # Caddy proxies /api/* to this URL. The default service name "e2a"
+      # resolves on the compose network — no extra config needed.
+      E2A_BACKEND: "http://e2a:8080"
+
+  # MCP HTTP transport. Forwards Bearer tokens to the e2a backend
+  # unchanged; the backend's prefix dispatch (ate2a_ vs e2a_) decides
+  # whether to validate via fosite (OAuth) or the API-key path. Local
+  # dev port 8765 is what Claude Code's `claude mcp add` expects.
+  mcp:
+    build:
+      context: .
+      dockerfile: mcp/Dockerfile
+    depends_on:
+      e2a:
+        condition: service_started
+    restart: unless-stopped
+    ports:
+      - "8765:3000"
+    environment:
+      # e2a backend reachable from inside the compose network.
+      E2A_URL: "http://e2a:8080"
+      # Allow loopback Host headers so Claude Code (which calls via
+      # http://localhost:8765) doesn't trip the DNS-rebinding guard.
+      MCP_ALLOWED_HOSTS: "localhost,127.0.0.1"
+      # Externally reachable URL. Used in the RFC 9728 protected-
+      # resource metadata + WWW-Authenticate header so OAuth clients
+      # bootstrap onto the right host.
+      MCP_PUBLIC_URL: "http://localhost:8765"
+      # Container-internal baseUrl ≠ host-reachable AS URL. The MCP
+      # server forwards bearers via the compose-network hostname
+      # (E2A_URL above) but Claude Code runs on the host and
+      # must reach the AS through the same web frontend that serves
+      # the consent UI. :3000 is the host-mapped web container, which
+      # proxies /api/oauth/* back to the e2a backend via Caddy. This
+      # keeps everything (issuer, AS endpoints, consent UI) on one
+      # origin — the way production runs behind a single Caddy.
+      MCP_AUTHORIZATION_SERVER_URL: "http://localhost:3000"
+
+volumes:
+  pgdata:
+  mailpit:

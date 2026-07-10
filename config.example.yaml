@@ -1,0 +1,155 @@
+# Copy to config.yaml and edit for your deployment.
+# Secrets should be set via env vars (E2A_*) — see README "Configuration".
+
+env: "development"  # Set to "production" to enforce TLS, HTTPS webhooks, and HMAC secret strength checks
+
+# Optional. When set, users can register agents by slug (no DNS setup required)
+# and the server provisions <slug>@<shared_domain>. Leave empty on a self-host
+# that doesn't operate a shared mail domain — every agent then needs a custom
+# domain that the user verifies via DNS. The shared domain itself becomes
+# reserved (cannot be claimed as a custom domain).
+shared_domain: ""
+
+smtp:
+  listen_addr: ":2525"
+  domain: "example.com"  # the domain whose MX record points at this relay
+  # tls_cert: "/path/to/cert.pem"
+  # tls_key: "/path/to/key.pem"
+
+http:
+  listen_addr: ":8080"
+  public_url: "http://localhost:8080"  # externally visible base URL (e.g. https://e2a.example.com); required for HITL magic-link emails
+
+database:
+  url: "postgres://e2a:e2a@localhost:5433/e2a?sslmode=disable"
+
+oauth:
+  google_client_id: ""
+  google_client_secret: ""
+  redirect_url: "http://localhost:3000/api/auth/callback"
+  # auth.md agent-identity token signing (Slice 5b). PEM-encoded RSA private
+  # key (PKCS#1 or PKCS#8); the public half is published at
+  # /.well-known/jwks.json so agents can verify e2a-minted JWTs. Empty leaves
+  # the agent-auth surface disabled (JWKS serves {"keys":[]}). Override via
+  # E2A_OAUTH_SIGNING_KEY. Never generated or persisted by e2a.
+  signing_key: ""
+  # kid advertised in the JWKS and stamped on every issued JWT (default "v1").
+  # Rotation: advertise a new kid, then retire the old after the longest token
+  # TTL. Override via E2A_OAUTH_SIGNING_KID.
+  signing_kid: "v1"
+
+signing:
+  # Generate with: openssl rand -hex 32
+  # Production refuses to start with this placeholder or with anything < 32 bytes.
+  hmac_secret: "change-me-in-production"
+
+outbound_smtp:
+  # Upstream SMTP relay for outbound mail (HITL approval notifications,
+  # /api/v1/agents/{email}/test sends, etc.). The defaults below are
+  # empty (host: "") so the binary will refuse to send rather than
+  # silently route through a wrong host — set them to one of:
+  #
+  #   - Local dev: `make docker-up` runs Mailpit on localhost:1025.
+  #     Set host: "localhost", port: 1025, from_domain: "e2a.localhost".
+  #     Captured mail appears at http://localhost:8025. No creds needed.
+  #
+  #   - Production (e.g. AWS SES): set host: "email-smtp.us-east-1.amazonaws.com",
+  #     port: 587, username/password from your IAM relay credentials,
+  #     from_domain to a domain DKIM-signed by your upstream.
+  host: ""
+  port: 587
+  username: ""
+  password: ""
+  from_domain: "relay.example.com"
+
+# Outbound send execution model (async-message-pipeline.md, slice C).
+#   sync  (default): the send API submits to the upstream relay inline and returns
+#          200 sent — the historical behavior.
+#   async: the send API durably persists the message + enqueues a River send job in
+#          one transaction and returns 200 accepted; a background worker submits to
+#          the relay and records the terminal outcome (email.sent / email.failed
+#          webhooks, GET /v1/messages/{id}). At-least-once delivery. Requires the
+#          shared River client (Postgres) — the same one webhook delivery / sender
+#          identity use. Override with E2A_OUTBOUND_MODE.
+outbound:
+  mode: "sync"
+
+# Custom-domain sender identity (decision 4 / Slice 4). When ses_region is set,
+# verifying a domain registers an AWS SES sending identity via BYODKIM (reusing
+# the per-domain DKIM key e2a already generates), and once SES confirms it,
+# outbound mail from agents on that domain uses the agent's OWN address as the
+# From header (DKIM-aligned → DMARC passes; replies reach the agent directly).
+# Leave empty (the default) to disable: every domain's sending_status stays
+# "none" and outbound keeps the relay "… via e2a" From — the fail-closed
+# default for dev/self-host without SES. Needs AWS credentials in the ambient
+# environment (env vars / instance role) with ses:CreateEmailIdentity,
+# ses:PutEmailIdentityMailFromAttributes, ses:GetEmailIdentity,
+# ses:DeleteEmailIdentity, ses:ListEmailIdentities. (Provisioning calls
+# PutEmailIdentityMailFromAttributes for the custom MAIL FROM — a role missing
+# it fails at that step even though CreateEmailIdentity succeeds.)
+# Override with E2A_SENDER_IDENTITY_SES_REGION.
+sender_identity:
+  ses_region: ""  # e.g. "us-east-1"
+
+# Outbound delivery feedback (decision 9 / Slice 4b). When ses_configuration_set
+# is set, outbound mail is tagged with X-SES-CONFIGURATION-SET so SES publishes
+# delivery/bounce/complaint events to an SNS topic; e2a's public endpoint
+# POST /webhooks/ses consumes them (SNS signature verified,
+# fail-closed) to drive messages.delivery_status, fire
+# email.delivered/bounced/complained, and auto-suppress hard-bounced/complained
+# recipients. sns_topic_arns is the allow-list of SNS topics that endpoint
+# accepts — EMPTY = reject everything (so the endpoint is inert until ops wires
+# the topic). Both empty (the default) disables delivery feedback entirely.
+# Override with E2A_DELIVERY_SES_CONFIGURATION_SET and E2A_DELIVERY_SNS_TOPIC_ARNS
+# (comma-separated). Setup: create an SES configuration set with an SNS event
+# destination (delivery+bounce+complaint), then subscribe e2a's endpoint to that
+# topic and list its ARN here.
+delivery_feedback:
+  ses_configuration_set: ""   # e.g. "e2a-delivery"
+  sns_topic_arns: []          # e.g. ["arn:aws:sns:us-east-2:123456789012:e2a-ses-events"]
+
+# Per-user resource caps applied when a user has no row in the
+# account_limits table. Hosted-service deployments overwrite these per
+# user via an external provisioner (the e2a-billing sidecar, an admin
+# tool, manual SQL). Self-host operators who do not run any provisioner
+# rely solely on these defaults — values below are intentionally high so
+# the limits subsystem is effectively off until you opt in.
+#
+# To convert a self-host into a paywall-aware install, set these to your
+# "free" shape and write the upgraded caps into account_limits from
+# whatever billing system you run.
+limits:
+  plan_code: "default"
+  max_agents: 1000000
+  max_domains: 1000000
+  max_messages_month: 1000000000
+  max_storage_bytes: 1125899906842624  # 1 PiB — effectively unbounded
+  cache_ttl_seconds: 60
+  # Shared HMAC secret used to authenticate /api/internal/limits/invalidate.
+  # Set this on both the e2a server and the external limits provisioner
+  # (e.g. a hosted-service billing sidecar). Leave empty for self-host
+  # without a provisioner — the endpoint will 503. Generate with:
+  # openssl rand -hex 32. Override with E2A_INTERNAL_API_SECRET.
+  internal_api_secret: ""
+  # URL the OSS server POSTs (HMAC-signed) when a user deletes their
+  # account, so an external billing service can cancel their
+  # subscription before the cascade drops the user row. Empty
+  # disables the call (self-host without billing). Example for a
+  # docker compose deployment alongside the hosted billing sidecar:
+  # billing_hook_url: "http://billing:9000/api/internal/billing/cancel"
+  billing_hook_url: ""
+
+
+
+# — Content screening (piguard) ——————————————————————————————————————————————
+# The Gemini LLM-as-detector layer is enabled by setting the environment
+# variable GEMINI_API_KEY (or GOOGLE_API_KEY) to a Google AI Studio key.
+# When the variable is absent the Gemini detector is silently skipped and
+# the dependency-free heuristics detector runs alone. It only screens INBOUND
+# mail (internal/relay); outbound agent-mail screening is heuristics-only.
+#
+# Obtain a key: https://aistudio.google.com/apikey
+# Model default: gemini-3.1-flash-lite (change via GEMINI_EVAL_MODEL env var)
+# Kill-switch: set E2A_GEMINI_DETECTOR_ENABLED=false to disable Gemini even when
+# a key is configured (e.g. to isolate whether Gemini or heuristics drove a given
+# block/review outcome, or to roll back without removing the credential).

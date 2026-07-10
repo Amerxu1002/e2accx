@@ -1,0 +1,45 @@
+{
+  "name": "web",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "scripts": {
+    "sync-openapi": "cp ../api/openapi.yaml public/openapi.yaml 2>/dev/null || echo 'sync-openapi: ../api/openapi.yaml not in build context (e.g. the web Docker image) — using the committed public/openapi.yaml'",
+    "predev": "npm run sync-openapi",
+    "dev": "next dev",
+    "prebuild": "npm run sync-openapi",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@e2a/ui": "file:../design-system",
+    "dompurify": "^3.4.11",
+    "next": "^16.2.10",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "swr": "^2.4.2"
+  },
+  "devDependencies": {
+    "@mdx-js/loader": "^3.1.1",
+    "@mdx-js/react": "^3.1.1",
+    "@next/mdx": "^16.2.10",
+    "@tailwindcss/postcss": "^4",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/jest": "^30.0.0",
+    "@types/mdx": "^2.0.14",
+    "@types/node": "^26",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.10",
+    "jest": "^30.4.2",
+    "jest-environment-jsdom": "^30.4.1",
+    "tailwindcss": "^4",
+    "ts-jest": "^29.4.11",
+    "typescript": "^5"
+  }
+}

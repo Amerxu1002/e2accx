@@ -1,0 +1,644 @@
+# Shared behavioral contract scenarios for the /v1 public API.
+#
+# The typed Huma /v1 surface (internal/httpapi) is the source of truth. The
+# legacy gorilla/mux /api/v1 surface has been fully retired (Slice 8e), so every
+# scenario here exercises /v1. The HITL magic-link pages moved to /v1/approve
+# and /v1/reject (raw HTML, served via the chi root's fallback to the mux).
+#
+# Each scenario is a sequence of steps executed against a live test server.
+# The Go runner (contract_test.go) consumes this file directly. TypeScript
+# and Python SDK runners will consume the same file in later phases, so the
+# format must remain language-agnostic.
+#
+# Setup helpers:
+#   register_domain — claim a domain directly in the store
+#   verify_domain   — mark a claimed domain verified in the store
+#   register_agent  — create an agent through the public API
+#   inject_message  — insert an inbound message directly in the store
+#
+# Step actions:
+#   request          — make an HTTP request, assert status and optional body fields
+#   inject_message   — insert an inbound message directly in the store
+#   ws_connect       — open a WebSocket connection
+#   ws_reconnect     — reconnect a WebSocket connection to trigger drain-on-reconnect
+#   ws_read          — read and assert one WebSocket notification
+#   verify_and_retry — verify a domain in the store, then replay an HTTP request
+#
+# Placeholder tokens (resolved by runner at execution time):
+#   {base_url}      — test server URL
+#   {api_key}       — valid API key for the test user
+#   {agent_email}   — agent email created by a prior register_agent setup step
+#   {injected_message_id} — message ID created by a prior inject_message step
+
+scenarios:
+
+  - name: agent_crud
+    description: Register, list, get (verify no leaked fields), delete agent
+    setup:
+      - register_domain: crud.test.dev
+      - verify_domain: crud.test.dev
+    steps:
+      - id: register
+        action: request
+        method: POST
+        path: /v1/agents
+        body:
+          email: bot@crud.test.dev
+        expect:
+          status: 201
+          body_contains:
+            - id
+            - email
+          body_match:
+            email: bot@crud.test.dev
+
+      - id: list
+        action: request
+        method: GET
+        path: /v1/agents
+        expect:
+          status: 200
+          body_contains:
+            - items
+          body_match:
+            "items[0].email": bot@crud.test.dev
+
+      - id: get
+        action: request
+        method: GET
+        path: /v1/agents/bot@crud.test.dev
+        expect:
+          status: 200
+          body_contains:
+            - id
+            - email
+          body_excludes:
+            - user_id
+            - public
+            - agent_mode
+            - webhook_url
+
+      - id: delete
+        action: request
+        method: DELETE
+        path: /v1/agents/bot@crud.test.dev?confirm=DELETE
+        # /v1 deleteAgent requires ?confirm=DELETE (AG-6); returns 204 No Content.
+        expect:
+          status: 204
+
+      - id: list_after_delete
+        action: request
+        method: GET
+        path: /v1/agents
+        expect:
+          status: 200
+          body_match:
+            "items.length": 0
+
+  - name: domain_crud
+    description: Register, list, verify, delete domain with typed responses
+    steps:
+      - id: register
+        action: request
+        method: POST
+        path: /v1/domains
+        body:
+          domain: domain-crud.test.dev
+        expect:
+          status: 201
+          body_contains:
+            - domain
+            - verified
+            - verification_token
+            - dns_records
+          body_match:
+            domain: domain-crud.test.dev
+            verified: false
+            # dns_records is now ONE purpose-tagged array (was an mx/txt/dkim
+            # object). [0]=ownership, [1]=inbound_mx are always first; status
+            # follows `verified` for inbound records (pending until verified).
+            "dns_records[0].purpose": "ownership"
+            "dns_records[0].type": "TXT"
+            "dns_records[0].status": "pending"
+            "dns_records[1].purpose": "inbound_mx"
+            "dns_records[1].type": "MX"
+            "dns_records[1].priority": 10
+
+      - id: list
+        action: request
+        method: GET
+        path: /v1/domains
+        expect:
+          status: 200
+          body_match:
+            "items.length": 1
+
+      - id: verify
+        action: request
+        method: POST
+        path: /v1/domains/domain-crud.test.dev/verify
+        # In the dev/test harness (Production=false) the DNS probe short-
+        # circuits TXTFound=true, so /v1 marks the domain verified and
+        # returns 200 + verified=true.
+        expect:
+          status: 200
+          body_match:
+            verified: true
+
+      - id: delete
+        action: request
+        method: DELETE
+        path: /v1/domains/domain-crud.test.dev?confirm=DELETE
+        # /v1 deleteDomain requires ?confirm=DELETE (D-5); DefaultStatus 204 (empty body).
+        expect:
+          status: 204
+
+  - name: read_state_transition
+    description: GET /messages/{id} marks unread messages as read
+    setup:
+      - register_domain: readstate.test.dev
+      - verify_domain: readstate.test.dev
+      - register_agent:
+          email: bot@readstate.test.dev
+      - inject_message:
+          agent_email: "{agent_email}"
+          from: alice@example.com
+          subject: Test read state
+    steps:
+      - id: list_unread
+        action: request
+        method: GET
+        path: /v1/agents/{agent_email}/messages?read_status=unread
+        # /v1 listMessages returns the standardized cursor page
+        # {"items":[...],"next_cursor":...} (not the legacy {"messages":[...]}).
+        expect:
+          status: 200
+          body_match:
+            "items.length": 1
+            "items[0].read_status": unread
+
+      - id: get_detail
+        action: request
+        method: GET
+        path: /v1/agents/{agent_email}/messages/{injected_message_id}
+        expect:
+          status: 200
+          body_contains:
+            - message_id
+            - auth_headers
+            - raw_message
+
+      - id: list_unread_after
+        action: request
+        method: GET
+        path: /v1/agents/{agent_email}/messages?read_status=unread
+        expect:
+          status: 200
+          body_match:
+            "items.length": 0
+
+      - id: list_read
+        action: request
+        method: GET
+        path: /v1/agents/{agent_email}/messages?read_status=read
+        expect:
+          status: 200
+          body_match:
+            "items.length": 1
+            "items[0].read_status": read
+
+  - name: placeholder_resolution
+    description: Placeholders resolve in request bodies and expected values
+    setup:
+      - register_domain: placeholder.test.dev
+      - verify_domain: placeholder.test.dev
+      - register_agent:
+          email: bot@placeholder.test.dev
+    steps:
+      - id: duplicate_register_with_placeholder
+        action: request
+        method: POST
+        path: /v1/agents
+        body:
+          email: "{agent_email}"
+        expect:
+          status: 409
+
+      - id: list_agents_matches_placeholder
+        action: request
+        method: GET
+        path: /v1/agents
+        expect:
+          status: 200
+          body_match:
+            "items[0].email": "{agent_email}"
+
+  - name: auth_rejection
+    description: Missing or invalid API keys get 401 across all endpoints
+    auth_override: none
+    steps:
+      - id: no_auth_list_agents
+        action: request
+        method: GET
+        path: /v1/agents
+        # /v1 errors use the envelope {"error":{"code","message","request_id"}};
+        # an unauthenticated call carries code=unauthorized.
+        expect:
+          status: 401
+          body_match:
+            "error.code": unauthorized
+
+      - id: no_auth_create_agent
+        action: request
+        method: POST
+        path: /v1/agents
+        # Body is schema-valid so the request reaches the auth check (the
+        # handler authenticates via requirePrincipal); this isolates the
+        # auth dimension rather than tripping body validation (422) first.
+        body:
+          email: auth-probe@example.com
+        expect:
+          status: 401
+          body_match:
+            "error.code": unauthorized
+
+      - id: no_auth_list_domains
+        action: request
+        method: GET
+        path: /v1/domains
+        expect:
+          status: 401
+          body_match:
+            "error.code": unauthorized
+
+      - id: no_auth_send
+        action: request
+        method: POST
+        path: /v1/agents/bot@example.com/messages
+        body:
+          to: ["someone@example.com"]
+          subject: probe
+          body: probe
+        expect:
+          status: 401
+          body_match:
+            "error.code": unauthorized
+
+  - name: auth_rejection_invalid_key
+    description: Invalid API key gets 401 across all endpoints
+    auth_override: "Bearer e2a_invalid_key_12345"
+    steps:
+      - id: invalid_key_list_agents
+        action: request
+        method: GET
+        path: /v1/agents
+        expect:
+          status: 401
+          body_match:
+            "error.code": unauthorized
+
+      - id: invalid_key_create_agent
+        action: request
+        method: POST
+        path: /v1/agents
+        body:
+          email: auth-probe@example.com
+        expect:
+          status: 401
+          body_match:
+            "error.code": unauthorized
+
+      - id: invalid_key_list_domains
+        action: request
+        method: GET
+        path: /v1/domains
+        expect:
+          status: 401
+          body_match:
+            "error.code": unauthorized
+
+      - id: invalid_key_send
+        action: request
+        method: POST
+        path: /v1/agents/bot@example.com/messages
+        body:
+          to: ["someone@example.com"]
+          subject: probe
+          body: probe
+        expect:
+          status: 401
+          body_match:
+            "error.code": unauthorized
+
+  - name: domain_verification_enforced
+    description: Agent registration blocked on unverified domain
+    setup:
+      - register_domain: unverified.test.dev
+    steps:
+      - id: register_on_unverified
+        action: request
+        method: POST
+        path: /v1/agents
+        body:
+          email: bot@unverified.test.dev
+        # /v1 createAgent rejects an unverified (but claimed) domain with a
+        # 400 envelope carrying code=domain_not_verified.
+        expect:
+          status: 400
+          body_match:
+            "error.code": domain_not_verified
+
+      - id: verify_then_register
+        action: verify_and_retry
+        verify_domain: unverified.test.dev
+        method: POST
+        path: /v1/agents
+        body:
+          email: bot@unverified.test.dev
+        expect:
+          status: 201
+
+  - name: ws_notification_shape
+    description: >
+      WebSocket drain-on-reconnect delivers notifications matching the
+      documented shape. Notification-only protocol: server sends
+      notifications, client never sends application frames.
+    setup:
+      - register_domain: ws.test.dev
+      - verify_domain: ws.test.dev
+      - register_agent:
+          email: bot@ws.test.dev
+    steps:
+      - id: connect
+        action: ws_connect
+        path: /v1/agents/{agent_email}/ws
+
+      - id: inject
+        action: inject_message
+        agent_email: "{agent_email}"
+        from: alice@example.com
+        subject: WS test
+
+      - id: reconnect
+        action: ws_reconnect
+        path: /v1/agents/{agent_email}/ws
+
+      - id: read_notification
+        action: ws_read
+        expect:
+          fields_present:
+            - message_id
+            - from
+            - recipient
+            - subject
+            - received_at
+          fields_absent:
+            - body
+            - raw_message
+            - to
+            - cc
+          field_match:
+            from: alice@example.com
+            recipient: "{agent_email}"
+            subject: WS test
+
+  - name: health_check
+    description: Health endpoint is available without auth
+    steps:
+      - id: health
+        action: request
+        method: GET
+        path: /api/health
+        auth_override: none
+        expect:
+          status: 200
+
+  - name: hitl_send_holds_202
+    description: >
+      With an outbound review policy on the agent (outbound_policy=allowlist +
+      outbound_policy_action=review, empty allowlist → every recipient unknown),
+      POST /send returns 202 + status=pending_review + approval_expires_at.
+      (hitl_enabled was retired — holds now come from the screening policy.)
+    setup:
+      - register_domain: hitl-hold.test.dev
+      - verify_domain: hitl-hold.test.dev
+      - register_agent:
+          email: bot@hitl-hold.test.dev
+    steps:
+      - id: enable_outbound_review
+        # Screening config lives on the account-scoped /protection sub-resource
+        # (PUT, full replace). An empty-allowlist outbound review gate holds every send.
+        action: request
+        method: PUT
+        path: /v1/agents/{agent_email}/protection
+        body:
+          inbound:
+            gate: {}
+            scan: {}
+          outbound:
+            gate:
+              policy: allowlist
+              action: review
+              allowlist: []
+            scan: {}
+          holds: {}
+        expect:
+          status: 200
+          body_match:
+            outbound.gate.action: review
+
+      - id: send_held
+        action: request
+        method: POST
+        path: /v1/agents/{agent_email}/messages
+        body:
+          to:
+            - alice@example.com
+          subject: Hold me
+          body: please review before sending
+        expect:
+          status: 202
+          body_contains:
+            - status
+            - message_id
+            - approval_expires_at
+          body_match:
+            status: pending_review
+
+  - name: hitl_reject_records_reason
+    description: >
+      Reject endpoint accepts a reason in the body and surfaces it. Catches the
+      chunked-body regression (rejection reason was silently dropped when
+      ContentLength was unknown). Uses the outbound review policy to hold the send
+      (hitl_enabled retired); reject yields the unified status=review_rejected.
+    setup:
+      - register_domain: hitl-reject.test.dev
+      - verify_domain: hitl-reject.test.dev
+      - register_agent:
+          email: bot@hitl-reject.test.dev
+    steps:
+      - id: enable_outbound_review
+        action: request
+        method: PUT
+        path: /v1/agents/{agent_email}/protection
+        body:
+          inbound:
+            gate: {}
+            scan: {}
+          outbound:
+            gate:
+              policy: allowlist
+              action: review
+              allowlist: []
+            scan: {}
+          holds: {}
+        expect:
+          status: 200
+
+      - id: send_held
+        action: request
+        method: POST
+        path: /v1/agents/{agent_email}/messages
+        body:
+          to:
+            - alice@example.com
+          subject: To be rejected
+          body: this should never go out
+        expect:
+          status: 202
+          body_contains:
+            - message_id
+        capture:
+          held_id: message_id
+
+      - id: reject
+        # The flat /api/v1/messages/{id}/reject route was dropped; reject is
+        # now the per-agent /v1 operation. RejectResultView surfaces
+        # {status, message_id, rejection_reason}. Status is the unified
+        # review_rejected (was the outbound-only 'rejected').
+        action: request
+        method: POST
+        path: /v1/agents/{agent_email}/messages/{held_id}/reject
+        body:
+          reason: off-topic for this audience
+        expect:
+          status: 200
+          body_match:
+            status: review_rejected
+            rejection_reason: off-topic for this audience
+
+  - name: messages_direction_all_shape
+    description: >
+      GET /agents/{email}/messages?direction=all returns the dashboard-
+      inbox shape: every row carries `direction`, outbound rows carry
+      `review_status` and `webhook_status`. Catches the H1 SDK contract
+      drift if httpapi.MessageSummaryView falls out of sync with the
+      handler again.
+    setup:
+      - register_domain: mixed.test.dev
+      - verify_domain: mixed.test.dev
+      - register_agent:
+          email: bot@mixed.test.dev
+      - inject_message:
+          agent_email: "{agent_email}"
+          from: external@example.com
+          subject: an inbound row
+    steps:
+      - id: enable_outbound_review
+        action: request
+        method: PUT
+        path: /v1/agents/{agent_email}/protection
+        body:
+          inbound:
+            gate: {}
+            scan: {}
+          outbound:
+            gate:
+              policy: allowlist
+              action: review
+              allowlist: []
+            scan: {}
+          holds: {}
+        expect:
+          status: 200
+
+      - id: outbound_held
+        action: request
+        method: POST
+        path: /v1/agents/{agent_email}/messages
+        body:
+          to:
+            - someone@example.com
+          subject: an outbound row
+          body: pending
+        expect:
+          status: 202
+
+      - id: list_mixed
+        # /v1 listMessages: cursor page envelope ({"items":[...]}), page-size
+        # param is `limit` (not legacy `page_size`). MessageSummaryView keeps
+        # the per-row `direction`; outbound rows carry `review_status`.
+        action: request
+        method: GET
+        path: /v1/agents/{agent_email}/messages?direction=all&limit=10
+        expect:
+          status: 200
+          body_contains:
+            - items
+          # Two rows — the order is most-recent-first so the outbound
+          # held row lands at index 0.
+          body_match:
+            "items.length": 2
+            "items[0].direction": outbound
+            "items[0].review_status": pending_review
+            "items[1].direction": inbound
+
+  - name: info_unauthenticated_shape
+    description: >
+      GET /v1/info is the deployment-discovery endpoint — works
+      without auth and surfaces shared_domain / slug_registration_enabled
+      / public_url. Catches drift in the DeploymentInfoView struct.
+    auth_override: none
+    steps:
+      - id: info
+        action: request
+        method: GET
+        path: /v1/info
+        expect:
+          status: 200
+          body_contains:
+            - shared_domain
+            - slug_registration_enabled
+
+  - name: ws_auth_rejection
+    description: WebSocket endpoint rejects a missing or invalid Authorization Bearer credential
+    setup:
+      - register_domain: wsauth.test.dev
+      - verify_domain: wsauth.test.dev
+      - register_agent:
+          email: bot@wsauth.test.dev
+    steps:
+      - id: no_auth
+        action: request
+        method: GET
+        path: /v1/agents/bot@wsauth.test.dev/ws
+        auth_override: none
+        expect:
+          status: 401
+
+      - id: invalid_bearer
+        action: request
+        method: GET
+        path: /v1/agents/bot@wsauth.test.dev/ws
+        auth_override: "Bearer invalid_key_12345"
+        expect:
+          status: 401
+
+      - id: query_token_rejected
+        # The legacy ?token= query is no longer accepted — only the header.
+        action: request
+        method: GET
+        path: /v1/agents/bot@wsauth.test.dev/ws?token=invalid_key_12345
+        auth_override: none
+        expect:
+          status: 401

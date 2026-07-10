@@ -1,0 +1,57 @@
+{
+  "name": "@e2a/sdk",
+  "version": "4.0.1",
+  "description": "TypeScript SDK for e2a — email for AI agents",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./v1": {
+      "types": "./dist/v1/index.d.ts",
+      "import": "./dist/v1/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run test:unit",
+    "test:unit": "vitest run test/v1/client.test.ts test/v1/ws.test.ts test/v1/webhook-signature.test.ts test/v1/errors.test.ts test/v1/retry.test.ts test/v1/pagination.test.ts",
+    "test:contract": "vitest run test/v1/contract.test.ts",
+    "test:live": "vitest run test/e2e.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "email",
+    "agent",
+    "e2a",
+    "webhook",
+    "ai"
+  ],
+  "author": "Mnexa AI <josh@mnexa.ai>",
+  "license": "Apache-2.0",
+  "homepage": "https://e2a.dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Mnexa-AI/e2a",
+    "directory": "sdks/typescript"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.4",
+    "vitest": "^4.1.9",
+    "yaml": "^2.9.0"
+  }
+}

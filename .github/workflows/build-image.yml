@@ -1,0 +1,136 @@
+name: Build and push Docker image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    # Re-run on PRs that could plausibly change either image. Two image
+    # variants (server + web) build in parallel via the matrix below;
+    # doc-only PRs are still skipped.
+    paths:
+      - "Dockerfile"
+      - "go.mod"
+      - "go.sum"
+      - "cmd/**"
+      - "internal/**"
+      - "web/**"
+      - "design-system/**"
+      - ".github/workflows/build-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write  # for keyless cosign signing via Sigstore OIDC
+
+concurrency:
+  # One concurrency group per ref. The matrix below already parallelizes
+  # the two images within a single run; the group then queues *across*
+  # runs so back-to-back pushes to the same ref don't race to publish
+  # the same tag (workflow-level concurrency can't reference matrix
+  # variables, so per-image scoping isn't possible without restructuring).
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Image builds shouldn't be canceled mid-flight: a half-pushed
+  # multi-arch manifest is recoverable but better avoided. Tests can be
+  # canceled (test.yml does), publishes shouldn't.
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.display_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # Don't cancel the server build if the web build fails (or vice
+      # versa) — they're independent images.
+      fail-fast: false
+      matrix:
+        include:
+          - image: e2a
+            display_name: server image
+            context: .
+            dockerfile: Dockerfile
+          - image: e2a-web
+            display_name: web image
+            # Repo root: the web image needs the sibling @e2a/ui workspace
+            # (file:../design-system). web/Dockerfile.dockerignore trims the
+            # context. See web/Dockerfile.
+            context: .
+            dockerfile: web/Dockerfile
+    steps:
+      - uses: actions/checkout@v7
+
+      # QEMU registers binfmt_misc handlers so this amd64 runner can
+      # cross-build arm64 layers under emulation. Without this step the
+      # arm64 build fails with "exec format error" — buildx alone does
+      # not install the emulators.
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      # Skip login on PR builds: we don't push from a PR, and PRs from
+      # forks only get a read-only GITHUB_TOKEN anyway.
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ghcr.io/mnexa-ai/${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-,format=long
+            # "latest" tracks the newest stable release, not the tip of
+            # main, so `docker pull …:latest` is never an untested build.
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - uses: docker/build-push-action@v7
+        id: build
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          # Build on PRs to verify the Dockerfile still works, but only
+          # push on real branch/tag/manual events.
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          # Per-image cache scopes — without scoping, the two matrix
+          # entries would clobber each other's cache and rebuild from
+          # scratch every time.
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          # Supply-chain transparency for OSS images: provenance records
+          # how the image was built; SBOM enumerates installed packages.
+          # Both are attached as in-toto attestations on the registry.
+          provenance: mode=max
+          sbom: true
+
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v3
+
+      # Keyless signing: the workflow's OIDC token gets exchanged for a
+      # short-lived cert from Sigstore's Fulcio CA. No long-lived keys
+      # to manage or rotate. Verify with:
+      #   cosign verify ghcr.io/mnexa-ai/<image>:<tag> \
+      #     --certificate-identity-regexp '^https://github\.com/Mnexa-AI/e2a/' \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+      - name: Sign image with cosign
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          images=""
+          for tag in ${TAGS}; do
+            images+="${tag}@${DIGEST} "
+          done
+          cosign sign --yes ${images}

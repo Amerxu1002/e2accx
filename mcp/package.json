@@ -1,0 +1,58 @@
+{
+  "name": "@e2a/mcp-server",
+  "version": "0.5.0",
+  "description": "MCP server for e2a \u2014 email for AI agents",
+  "mcpName": "io.github.Mnexa-AI/mcp-server",
+  "type": "module",
+  "main": "./dist/bin/http.js",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "email",
+    "agent",
+    "ai",
+    "e2a",
+    "adk",
+    "google-adk",
+    "langchain",
+    "claude",
+    "anthropic",
+    "openai",
+    "agents"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mnexa-AI/e2a.git",
+    "directory": "mcp"
+  },
+  "homepage": "https://github.com/Mnexa-AI/e2a/tree/main/mcp",
+  "bugs": "https://github.com/Mnexa-AI/e2a/issues",
+  "dependencies": {
+    "@e2a/sdk": "^4.0.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "cors": "^2.8.5",
+    "express": "^5.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^26.1.0",
+    "supertest": "^7.0.0",
+    "@types/supertest": "^7.2.0",
+    "typescript": "^5.4",
+    "vitest": "^4.1.9"
+  }
+}
